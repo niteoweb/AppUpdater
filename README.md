@@ -30,7 +30,7 @@ Main changes:
 ## Usage
 
 ```swift
-package.dependencies.append(.package(url: "https://github.com/niteoweb/AppUpdater.git", from: "1.0.0"))
+package.dependencies.append(.package(url: "https://github.com/niteoweb/AppUpdater.git", from: "2.0.0"))
 ```
 
 Then:
