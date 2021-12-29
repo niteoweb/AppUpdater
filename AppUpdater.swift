@@ -1,103 +1,153 @@
-import class AppKit.NSBackgroundActivityScheduler
 import var AppKit.NSApp
-import PMKFoundation
+import Cocoa
 import Foundation
-import PromiseKit
-import Version
+import os.log
 import Path
+import Version
 
-public class AppUpdater {
-    var active = Promise()
-#if !DEBUG
-    let activity: NSBackgroundActivityScheduler
-#endif
-    let owner: String
-    let repo: String
+public enum UpdaterError: Swift.Error {
+    case bundleExecutableURL
+    case codeSigningIdentity
+    case invalidDownloadedBundle
+    case badInput
+}
 
-    var slug: String {
-        return "\(owner)/\(repo)"
-    }
-    
-    public var allowPrereleases = false
+public class GithubAppUpdater {
+    let activity: NSBackgroundActivityScheduler?
+    let url: URL
+    let allowPrereleases: Bool
 
-    public init(owner: String, repo: String) {
-        self.owner = owner
-        self.repo = repo
-    #if DEBUG
-        check().cauterize()
-    #else
-        activity = NSBackgroundActivityScheduler(identifier: "dev.mxcl.AppUpdater")
-        activity.repeats = true
-        activity.interval = 24 * 60 * 60
-        activity.schedule { [unowned self] completion in
-            guard !self.activity.shouldDefer, self.active.isResolved else {
-                return completion(.deferred)
-            }
-            self.check().cauterize().finally {
+    public init(
+        updateURL: String,
+        allowPrereleases: Bool = false,
+        autoGuard: Bool = true,
+        interval: TimeInterval = 24 * 60 * 60
+    ) {
+        url = URL(string: updateURL)!
+        self.allowPrereleases = allowPrereleases
+
+        // Prevent multiple running apps after the update
+        // Terminate oldest process
+        let processes = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier!)
+        if processes.count > 1, autoGuard {
+            processes.first?.forceTerminate()
+        }
+        if interval > 0 {
+            activity = NSBackgroundActivityScheduler(identifier: "\(String(describing: Bundle.main.bundleIdentifier)).Updater")
+            activity?.repeats = true
+            activity?.interval = interval
+            activity?.schedule { completion in
+                _ = self.update()
                 completion(.finished)
             }
+        } else {
+            activity = nil
         }
-    #endif
     }
 
-#if !DEBUG
-    deinit {
-        activity.invalidate()
-    }
-#endif
-
-    private enum Error: Swift.Error {
-        case bundleExecutableURL
-        case codeSigningIdentity
-        case invalidDownloadedBundle
-    }
-
-    public func check() -> Promise<Void> {
-        guard active.isResolved else {
-            return active
-        }
-        guard Bundle.main.executableURL != nil else {
-            return Promise(error: Error.bundleExecutableURL)
-        }
+    func update() -> Bool {
         let currentVersion = Bundle.main.version
-
-        func validate(codeSigning b1: Bundle, _ b2: Bundle) -> Promise<Void> {
-            return firstly {
-                when(fulfilled: b1.codeSigningIdentity, b2.codeSigningIdentity)
-            }.done {
-                guard $0 == $1 else { throw Error.codeSigningIdentity }
+        if let release = try? getLatestRelease(allowPrereleases: allowPrereleases) {
+            if currentVersion < release.version {
+                if let zipURL = release.assets.filter({ $0.browserDownloadURL.path.hasSuffix(".zip") }).first {
+                    return downloadAndUpdate(withAsset: zipURL)
+                }
             }
         }
+        return false
+    }
 
-        func update(with asset: Release.Asset) throws -> Promise<Void> {
+    deinit {
+        activity?.invalidate()
+    }
+
+    func getLatestRelease(allowPrereleases prerelease: Bool) throws -> Release? {
+        guard Bundle.main.executableURL != nil else {
+            throw UpdaterError.bundleExecutableURL
+        }
+
+        let data = try Data(contentsOf: url)
+        let releases = try JSONDecoder().decode([Release].self, from: data)
+        let release = try releases.findViableUpdate(prerelease: prerelease)
+        return release
+    }
+
+    func downloadAndUpdate(withAsset asset: Release.Asset) -> Bool {
         #if DEBUG
-            print("notice: AppUpdater dry-run:", asset)
-            return Promise()
+            os_log("In debug build updates are disabled")
+            return false
         #else
-            let tmpdir = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: Bundle.main.bundleURL, create: true)
-
-            return firstly {
-                URLSession.shared.downloadTask(.promise, with: asset.browser_download_url, to: tmpdir.appendingPathComponent("download"))
-            }.then { dst, _ in
-                unzip(dst, contentType: asset.content_type)
-            }.compactMap { downloadedAppBundle in
-                Bundle(url: downloadedAppBundle)
-            }.then { downloadedAppBundle in
-                validate(codeSigning: .main, downloadedAppBundle).map{ downloadedAppBundle }
-            }.done { downloadedAppBundle in
-
-                // UNIX is cool. Delete ourselves, move new one in then restart.
-
-                let installedAppBundle = Bundle.main
-                guard let exe = downloadedAppBundle.executable, exe.exists else {
-                    throw Error.invalidDownloadedBundle
+            let lock = DispatchSemaphore(value: 0)
+            var state = false
+            let tempDirectory = try! FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: Bundle.main.bundleURL, create: true)
+            URLSession.shared.downloadTask(with: asset.browser_download_url) { tempLocalUrl, response, error in
+                if error != nil {
+                    os_log("Error took place while downloading a file: \(error!.localizedDescription)")
+                    lock.signal()
+                    return
                 }
-                let finalExecutable = installedAppBundle.path/exe.relative(to: downloadedAppBundle.path)
 
+                if let tempLocalUrl = tempLocalUrl {
+                    // Success
+                    if let statusCode = (response as? HTTPURLResponse)?.statusCode {
+                        if statusCode != 200 {
+                            os_log("Failed to download \(asset.browser_download_url). Status code: \(statusCode)")
+                            lock.signal()
+                            return
+                        }
+
+                        os_log("Successfully downloaded \(asset.browser_download_url). Status code: \(statusCode)")
+                        let downloadPath = tempDirectory.appendingPathComponent("download")
+                        do {
+                            try FileManager.default.copyItem(at: tempLocalUrl, to: downloadPath)
+                        } catch let writeError {
+                            os_log("Error moving a file \(tempLocalUrl) to \(downloadPath): \(writeError.localizedDescription)")
+                            lock.signal()
+                        }
+
+                        os_log("Doing update from \(tempLocalUrl)")
+                        do {
+                            try self.update(withApp: downloadPath, withAsset: asset)
+                            state = true
+                            lock.signal()
+                        } catch let writeError {
+                            os_log("Error updating with file \(downloadPath) : \(writeError.localizedDescription)")
+                            lock.signal()
+                        }
+                    } else {
+                        os_log("Could not parse response of \(asset.browser_download_url)")
+                        lock.signal()
+                    }
+                } else {
+                    os_log("Error updating from \(asset.browser_download_url), missing local file")
+                    lock.signal()
+                }
+            }.resume()
+            lock.wait()
+            try? FileManager.default.removeItem(at: tempDirectory)
+            return state
+        #endif
+    }
+
+    private func validate(_ b1: Bundle, _ b2: Bundle) -> Bool {
+        b1.codeSigningIdentity == b2.codeSigningIdentity
+    }
+
+    private func update(withApp destination: URL, withAsset asset: Release.Asset) throws {
+        let bundlePath = unzip(destination, contentType: asset.contentType)
+        let downloadedAppBundle = Bundle(url: bundlePath)!
+        let installedAppBundle = Bundle.main
+        guard let exe = downloadedAppBundle.executable, exe.exists else {
+            throw UpdaterError.invalidDownloadedBundle
+        }
+        let finalExecutable = installedAppBundle.path / exe.relative(to: downloadedAppBundle.path)
+        if validate(downloadedAppBundle, installedAppBundle) {
+            do {
                 try installedAppBundle.path.delete()
+                os_log("Delete installedAppBundle: \(installedAppBundle)")
                 try downloadedAppBundle.path.move(to: installedAppBundle.path)
-                try FileManager.default.removeItem(at: tmpdir)
-
+                os_log("Move new app to installedAppBundle: \(installedAppBundle)")
+                // runOSA(appleScript: "activate application \"Pareto Security\"")
                 let proc = Process()
                 if #available(OSX 10.13, *) {
                     proc.executableURL = finalExecutable.url
@@ -105,96 +155,22 @@ public class AppUpdater {
                     proc.launchPath = finalExecutable.string
                 }
                 proc.launch()
+                DispatchQueue.main.async {
+                    NSApp.terminate(self)
+                }
 
-                // seems to work, though for sure, seems asking a lot for it to be reliable!
-                //TODO be reliable! Probably get an external applescript to ask us this one to quit then exec the new one
-                NSApp.terminate(self)
-            }.ensure {
-                _ = try? FileManager.default.removeItem(at: tmpdir)
+            } catch {
+                os_log("Failed update: \(error.localizedDescription)")
+                throw UpdaterError.invalidDownloadedBundle
             }
-        #endif
-        }
-
-        let url = URL(string: "https://api.github.com/repos/\(slug)/releases")!
-
-        active = firstly {
-            URLSession.shared.dataTask(.promise, with: url).validate()
-        }.map {
-            try JSONDecoder().decode([Release].self, from: $0.data)
-        }.compactMap { releases in
-            try releases.findViableUpdate(appVersion: currentVersion, repo: self.repo, prerelease: self.allowPrereleases)
-        }.then { asset in
-            try update(with: asset)
-        }
-
-        return active
-    }
-}
-
-private struct Release: Decodable {
-    let tag_name: Version
-    let prerelease: Bool
-    struct Asset: Decodable {
-        let name: String
-        let browser_download_url: URL
-        let content_type: ContentType
-    }
-    let assets: [Asset]
-
-    func viableAsset(forRepo repo: String) -> Asset? {
-        return assets.first(where: { (asset) -> Bool in
-            let prefix = "\(repo.lowercased())-\(tag_name)"
-            let name = (asset.name as NSString).deletingPathExtension.lowercased()
-
-            switch (name, asset.content_type) {
-            case ("\(prefix).tar", .tar):
-                return true
-            case (prefix, _):
-                return true
-            default:
-                return false
-            }
-        })
-    }
-}
-
-private enum ContentType: Decodable {
-    init(from decoder: Decoder) throws {
-        switch try decoder.singleValueContainer().decode(String.self) {
-        case "application/x-bzip2", "application/x-xz", "application/x-gzip":
-            self = .tar
-        case "application/zip":
-            self = .zip
-        default:
-            throw PMKError.badInput
+        } else {
+            os_log("Failed codeSigningIdentity")
+            throw UpdaterError.codeSigningIdentity
         }
     }
-
-    case zip
-    case tar
 }
 
-extension Release: Comparable {
-    static func < (lhs: Release, rhs: Release) -> Bool {
-        return lhs.tag_name < rhs.tag_name
-    }
-
-    static func == (lhs: Release, rhs: Release) -> Bool {
-        return lhs.tag_name == rhs.tag_name
-    }
-}
-
-private extension Array where Element == Release {
-    func findViableUpdate(appVersion: Version, repo: String, prerelease: Bool) throws -> Release.Asset? {
-        let suitableReleases = prerelease ? self : filter{ !$0.prerelease }
-        guard let latestRelease = suitableReleases.sorted().last else { return nil }
-        guard appVersion < latestRelease.tag_name else { throw PMKError.cancelled }
-        return latestRelease.viableAsset(forRepo: repo)
-    }
-}
-
-private func unzip(_ url: URL, contentType: ContentType) -> Promise<URL> {
-
+private func unzip(_ url: URL, contentType: Release.Asset.ContentType) -> URL {
     let proc = Process()
     if #available(OSX 10.13, *) {
         proc.currentDirectoryURL = url.deletingLastPathComponent()
@@ -209,52 +185,20 @@ private func unzip(_ url: URL, contentType: ContentType) -> Promise<URL> {
     case .zip:
         proc.launchPath = "/usr/bin/unzip"
         proc.arguments = [url.path]
+    case .unknown:
+        proc.launchPath = "/usr/bin/unzip"
+        proc.arguments = [url.path]
     }
-
     func findApp() throws -> URL? {
-        let cnts = try FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: [.isDirectoryKey], options: .skipsSubdirectoryDescendants)
-        for url in cnts {
+        let files = try FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: [.isDirectoryKey], options: .skipsSubdirectoryDescendants)
+        for url in files {
             guard url.pathExtension == "app" else { continue }
             guard let foo = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory, foo else { continue }
             return url
         }
         return nil
     }
-
-    return firstly {
-        proc.launch(.promise)
-    }.compactMap { _ in
-        try findApp()
-    }
-}
-
-private extension Bundle {
-    var isCodeSigned: Guarantee<Bool> {
-        let proc = Process()
-        proc.launchPath = "/usr/bin/codesign"
-        proc.arguments = ["-dv", bundlePath]
-        return proc.launch(.promise).map { _ in
-            true
-        }.recover { _ in
-            .value(false)
-        }
-    }
-
-    var codeSigningIdentity: Promise<String> {
-        let proc = Process()
-        proc.launchPath = "/usr/bin/codesign"
-        proc.arguments = ["-dvvv", bundlePath]
-
-        return firstly {
-            proc.launch(.promise)
-        }.compactMap {
-            String(data: $0.err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
-        }.map {
-            $0.split(separator: "\n")
-        }.filterValues {
-            $0.hasPrefix("Authority=")
-        }.firstValue.map { line in
-            String(line.dropFirst(10))
-        }
-    }
+    proc.launch()
+    proc.waitUntilExit()
+    return try! findApp()!
 }
