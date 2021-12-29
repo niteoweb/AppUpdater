@@ -1,5 +1,7 @@
 # AppUpdater
 
+[![.github/workflows/ci.yml](https://github.com/niteoweb/AppUpdater/actions/workflows/ci.yml/badge.svg)](https://github.com/niteoweb/AppUpdater/actions/workflows/ci.yml)
+
 A simple app-updater for macOS, checks your GitHub releases for a binary asset
 once a day and silently updates your app. Forked from mxcl/AppUpdater.
 
