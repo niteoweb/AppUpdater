@@ -37,7 +37,7 @@ public class GithubAppUpdater {
             activity?.repeats = true
             activity?.interval = interval
             activity?.schedule { completion in
-                _ = self.update()
+                _ = self.checkAndUpdate()
                 completion(.finished)
             }
         } else {
@@ -45,7 +45,7 @@ public class GithubAppUpdater {
         }
     }
 
-    func update() -> Bool {
+    public func checkAndUpdate() -> Bool {
         let currentVersion = Bundle.main.version
         if let release = try? getLatestRelease(allowPrereleases: allowPrereleases) {
             if currentVersion < release.version {
@@ -61,7 +61,7 @@ public class GithubAppUpdater {
         activity?.invalidate()
     }
 
-    func getLatestRelease(allowPrereleases prerelease: Bool) throws -> Release? {
+    public func getLatestRelease(allowPrereleases prerelease: Bool) throws -> Release? {
         guard Bundle.main.executableURL != nil else {
             throw UpdaterError.bundleExecutableURL
         }
@@ -72,15 +72,21 @@ public class GithubAppUpdater {
         return release
     }
 
-    func downloadAndUpdate(withAsset asset: Release.Asset) -> Bool {
+    public func downloadAndUpdate(withAsset asset: Release.Asset) -> Bool {
         #if DEBUG
-            os_log("In debug build updates are disabled")
+            os_log("In debug target updates are disabled! Asset: %s", asset.browserDownloadURL.debugDescription)
             return false
         #else
             let lock = DispatchSemaphore(value: 0)
             var state = false
-            let tempDirectory = try! FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: Bundle.main.bundleURL, create: true)
-            URLSession.shared.downloadTask(with: asset.browser_download_url) { tempLocalUrl, response, error in
+            let tempDirectory = try! FileManager.default.url(
+                for: .itemReplacementDirectory,
+                in: .userDomainMask,
+                appropriateFor: Bundle.main.bundleURL,
+                create: true
+            )
+
+            URLSession.shared.downloadTask(with: asset.browserDownloadURL) { tempLocalUrl, response, error in
                 if error != nil {
                     os_log("Error took place while downloading a file: \(error!.localizedDescription)")
                     lock.signal()
@@ -91,12 +97,12 @@ public class GithubAppUpdater {
                     // Success
                     if let statusCode = (response as? HTTPURLResponse)?.statusCode {
                         if statusCode != 200 {
-                            os_log("Failed to download \(asset.browser_download_url). Status code: \(statusCode)")
+                            os_log("Failed to download \(asset.browserDownloadURL). Status code: \(statusCode)")
                             lock.signal()
                             return
                         }
 
-                        os_log("Successfully downloaded \(asset.browser_download_url). Status code: \(statusCode)")
+                        os_log("Successfully downloaded \(asset.browserDownloadURL). Status code: \(statusCode)")
                         let downloadPath = tempDirectory.appendingPathComponent("download")
                         do {
                             try FileManager.default.copyItem(at: tempLocalUrl, to: downloadPath)
@@ -115,11 +121,11 @@ public class GithubAppUpdater {
                             lock.signal()
                         }
                     } else {
-                        os_log("Could not parse response of \(asset.browser_download_url)")
+                        os_log("Could not parse response of \(asset.browserDownloadURL)")
                         lock.signal()
                     }
                 } else {
-                    os_log("Error updating from \(asset.browser_download_url), missing local file")
+                    os_log("Error updating from \(asset.browserDownloadURL), missing local file")
                     lock.signal()
                 }
             }.resume()
