@@ -12,6 +12,10 @@ Main changes:
 - Configurable update URL, interval of updates
 - Runtime guard to prevent multiple instances
 
+Used by:
+- https://github.com/teamniteo/work-hours-mac
+
+
 ## Caveats
 
 * We make no allowances for ensuring your app is not being actively used by the user
@@ -41,11 +45,11 @@ import AppUpdater
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate {
     
-    static let updater = AppUpdater(
-        updateURL: "https://api.github.com/repos/ParetoSecurity/pareto-mac/releases",
-        allowPrereleases: true,
+    static let updater = GithubAppUpdater(
+        updateURL: "https://api.github.com/repos/teamniteo/work-hours-mac/releases",
+        allowPrereleases: false,
         autoGuard: true,
-        interval: 0  // set to zero if you want manual updates
+        interval: 60 * 60
     )
     
     ...
