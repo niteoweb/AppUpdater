@@ -9,11 +9,15 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/mxcl/Path.swift", from: "1.0.0"),
+        .package(url: "https://github.com/mxcl/Version", from: "1.0.0")
     ],
     targets: [
         .target(
             name: "AppUpdater",
-            dependencies: [.product(name: "Path", package: "Path.swift"), "Version"],
+            dependencies: [
+                .product(name: "Path", package: "Path.swift"),
+                .product(name: "Version", package: "Version")
+            ],
             path: ".",
             exclude: ["LICENSE.md", "README.md", "Makefile"],
             sources: ["AppUpdater.swift", "Release.swift", "Extension+Bundle.swift"]
