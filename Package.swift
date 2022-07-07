@@ -18,7 +18,7 @@ let package = Package(
                 .product(name: "Path", package: "Path.swift"),
                 .product(name: "Version", package: "Version")
             ],
-            path: "Sources",
+            path: "Sources"
         )
     ],
     swiftLanguageVersions: [.version("5.5")]
