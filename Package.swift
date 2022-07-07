@@ -9,7 +9,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/mxcl/Path.swift", from: "1.0.0"),
-        .package(url: "https://github.com/mxcl/Version", from: "1.0.0")
+        .package(url: "https://github.com/ParetoSecurity/Version", from: "1.0.0")
     ],
     targets: [
         .target(
@@ -18,9 +18,7 @@ let package = Package(
                 .product(name: "Path", package: "Path.swift"),
                 .product(name: "Version", package: "Version")
             ],
-            path: ".",
-            exclude: ["LICENSE.md", "README.md", "Makefile"],
-            sources: ["AppUpdater.swift", "Release.swift", "Extension+Bundle.swift"]
+            path: "Sources",
         )
     ],
     swiftLanguageVersions: [.version("5.5")]
